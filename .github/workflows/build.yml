@@ -1,0 +1,190 @@
+name: Build XMRig Releases
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-20.04
+            label: ubuntu-latest
+            container: ubuntu:20.04
+          - os: ubuntu-22.04
+            label: ubuntu-22.04
+          - os: ubuntu-24.04
+            label: ubuntu-24.04
+          - os: ubuntu-25.04
+            label: ubuntu-latest
+            container: ubuntu:25.04
+          - os: alpine
+            label: ubuntu-latest
+            distro: alpine
+          - os: windows-latest
+            label: windows-latest
+          - os: macos-latest
+            label: macos-latest
+
+    runs-on: ${{ matrix.label }}
+    name: Build for ${{ matrix.os }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      # Build in container - Alpine
+      - name: Build in container (Alpine)
+        if: matrix.distro == 'alpine'
+        run: |
+          docker run --rm -v $PWD:/src -w /src alpine:latest sh -c '
+            apk add --no-cache git cmake make g++ automake libtool autoconf linux-headers &&
+            mkdir build &&
+            cd scripts && ./build_deps.sh &&
+            cd ../build &&
+            cmake .. -DCMAKE_BUILD_TYPE=Release -DXMRIG_DEPS=/src/scripts/deps -DBUILD_STATIC=ON &&
+            cmake --build . --config Release'
+
+      # Build in container - Debian-based (e.g. Ubuntu)
+      - name: Build in container (Debian/Ubuntu)
+        if: matrix.container && !matrix.distro
+        run: |
+          docker run --rm -e TZ="Etc/UTC" -e DEBIAN_FRONTEND="noninteractive" -v $PWD:/src -w /src ${{ matrix.container }} bash -c '
+            apt update &&
+            apt install -y build-essential cmake automake libtool autoconf git wget &&
+            mkdir build &&
+            cd scripts && ./build_deps.sh &&
+            cd ../build &&
+            cmake .. -DCMAKE_BUILD_TYPE=Release -DXMRIG_DEPS=/src/scripts/deps &&
+            cmake --build . --config Release'
+
+      # Native Linux build
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux' && !matrix.container && !matrix.distro
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential cmake automake libtool autoconf
+
+      - name: Build static dependencies and build XMRig (Linux)
+        if: runner.os == 'Linux' && !matrix.container && !matrix.distro
+        run: |
+          mkdir build
+          cd scripts
+          ./build_deps.sh
+          cd ../build
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DXMRIG_DEPS=$GITHUB_WORKSPACE/scripts/deps
+          cmake --build . --config Release
+
+      # Windows build
+      - name: Set up MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Download and extract XMRig dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          Invoke-WebRequest -Uri https://github.com/xmrig/xmrig-deps/archive/refs/heads/master.zip -OutFile deps.zip
+          Expand-Archive -Path deps.zip -DestinationPath .
+          New-Item -ItemType Directory -Path C:\xmrig-deps
+          Copy-Item -Path .\xmrig-deps-master\msvc2019 -Destination C:\xmrig-deps\msvc2019 -Recurse
+
+      - name: Configure CMake (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir build
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DXMRIG_DEPS=C:\xmrig-deps\msvc2019\x64
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd build
+          cmake --build . --config Release
+          copy Release\\xmrig.exe .\\xmrig.exe
+
+      # macOS build
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake wget automake libtool autoconf openssl hwloc
+
+      - name: Build XMRig (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir build
+          cd scripts
+          ./build.hwloc.sh
+          cd ../build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOPENSSL_ROOT_DIR=$(brew --prefix openssl) \
+            -DHWLOC_INCLUDE_DIR=$GITHUB_WORKSPACE/scripts/deps/include \
+            -DHWLOC_LIBRARY=$GITHUB_WORKSPACE/scripts/deps/lib/libhwloc.a
+          cmake --build . --config Release
+
+      # Upload artifacts
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xmrig-${{ matrix.os }}
+          path: |
+            build/xmrig.exe
+            build/xmrig
+          if-no-files-found: ignore
+
+  release:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete previous canary release and tag (if exists)
+        if: github.ref_type != 'tag'
+        uses: dev-drprasad/delete-tag-and-release@v1.1
+        with:
+          tag_name: canary
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Set release tag
+        id: vars
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=canary" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Package binaries by platform
+        run: |
+          mkdir release
+          for dir in artifacts/*; do
+            name=$(basename "$dir")
+            exe=$(find "$dir" -type f -name "xmrig.exe" | head -n1)
+            bin=$(find "$dir" -type f -name "xmrig" | head -n1)
+            if [[ -n "$exe" ]]; then
+              zip -j "release/$name.zip" "$exe"
+            elif [[ -n "$bin" ]]; then
+              zip -j "release/$name.zip" "$bin"
+            fi
+          done
+
+      - name: Create GitHub Release with binaries
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: ${{ steps.vars.outputs.tag }}
+          prerelease: ${{ github.ref_type != 'tag' }}
+          files: release/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
