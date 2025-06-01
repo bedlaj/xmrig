@@ -1,0 +1,38 @@
+name: Auto Merge Upstream Master
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Every day at midnight UTC
+  workflow_dispatch:
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork repository (full history)
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Fetch full history to allow proper merging
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/xmrig/xmrig.git
+
+      - name: Fetch upstream master
+        run: git fetch upstream master
+
+      - name: Merge upstream/master into fork/master
+        run: |
+          git checkout master
+          git merge --no-edit upstream/master
+
+      - name: Push merged changes to fork
+        uses: ad-m/github-push-action@v0.6.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          branch: master
